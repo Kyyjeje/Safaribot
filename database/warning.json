@@ -1,0 +1,19 @@
+{
+  "120363052450613121@g.us": {
+    "limit": 3,
+    "users": {
+      "6289647205008@s.whatsapp.net": {
+        "count": 1,
+        "kick": false
+      },
+      "6285746553251@s.whatsapp.net": {
+        "count": 1,
+        "kick": false
+      },
+      "6283194931567@s.whatsapp.net": {
+        "count": 2,
+        "kick": false
+      }
+    }
+  }
+}

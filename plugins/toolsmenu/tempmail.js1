@@ -1,0 +1,277 @@
+require('../../settings');
+const fs = require('fs');
+const path = require('path');
+const axios = require('axios');
+
+const tempmailFile = path.join(__dirname, '../../database/tempmail.json');
+
+function loadTempMail() {
+    if (fs.existsSync(tempmailFile)) {
+        const data = fs.readFileSync(tempmailFile, 'utf8');
+        return JSON.parse(data);
+    }
+    return {};
+}
+
+function saveTempMail(tempmailData) {
+    const dir = path.dirname(tempmailFile);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(tempmailFile, JSON.stringify(tempmailData, null, 2), 'utf8');
+}
+
+const activeTempMailTimers = {};
+const activeMonitoringIntervals = {};
+let tempmailData = loadTempMail();
+
+for (const userId in tempmailData) {
+    if (!Array.isArray(tempmailData[userId])) tempmailData[userId] = [tempmailData[userId]];
+    tempmailData[userId] = tempmailData[userId].filter(mail => {
+        const expiresAt = new Date(mail.expiresAt);
+        if (expiresAt <= new Date()) {
+            if (activeTempMailTimers[`${userId}_${mail.email}`]) {
+                clearTimeout(activeTempMailTimers[`${userId}_${mail.email}`]);
+                delete activeTempMailTimers[`${userId}_${mail.email}`];
+            }
+            if (activeMonitoringIntervals[`${userId}_${mail.email}`]) {
+                clearInterval(activeMonitoringIntervals[`${userId}_${mail.email}`]);
+                delete activeMonitoringIntervals[`${userId}_${mail.email}`];
+            }
+            return false;
+        }
+        return true;
+    });
+    if (tempmailData[userId].length === 0) delete tempmailData[userId];
+}
+saveTempMail(tempmailData);
+
+class TempMail {
+    constructor() {
+        this.cookie = null;
+        this.baseUrl = 'https://tempmail.so';
+    }
+
+    async updateCookie(response) {
+        if (response.headers['set-cookie']) this.cookie = response.headers['set-cookie'].join('; ');
+    }
+
+    async makeRequest(url) {
+        const response = await axios({
+            method: 'GET',
+            url,
+            headers: {
+                accept: 'application/json',
+                cookie: this.cookie || '',
+                referer: this.baseUrl + '/',
+                'x-inbox-lifespan': '600',
+                'sec-ch-ua': '"Not A(Brand";v="8", "Chromium";v="132"',
+                'sec-ch-ua-mobile': '?1'
+            }
+        });
+        await this.updateCookie(response);
+        return response;
+    }
+
+    async initialize() {
+        const response = await axios.get(this.baseUrl, {
+            headers: {
+                accept: 'text/html,application/xhtml+xml,application/xml;q=0.9',
+                'sec-ch-ua': '"Not A(Brand";v="8", "Chromium";v="132"'
+            }
+        });
+        await this.updateCookie(response);
+        return this;
+    }
+
+    async getInbox() {
+        const url = `${this.baseUrl}/us/api/inbox?requestTime=${Date.now()}&lang=us`;
+        const response = await this.makeRequest(url);
+        return response.data;
+    }
+
+    async getMessage(messageId) {
+        const url = `${this.baseUrl}/us/api/inbox/messagehtmlbody/${messageId}?requestTime=${Date.now()}&lang=us`;
+        const response = await this.makeRequest(url);
+        return response.data;
+    }
+}
+
+async function createTempMail() {
+    const mail = new TempMail();
+    await mail.initialize();
+    const inbox = await mail.getInbox();
+    if (!inbox.data?.name) throw new Error('Failed to get temporary email');
+    return {
+        email: inbox.data.name,
+        sessionId: mail,
+        expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString()
+    };
+}
+
+function getRemainingTime(expiresAt) {
+    const now = new Date();
+    const expires = new Date(expiresAt);
+    const diffMins = Math.round((expires - now) / 1000 / 60);
+    return `${diffMins} menit dari sekarang`;
+}
+
+function monitorEmails(naze, chatId, mailInstance, sender, originalMessage, emailId, userId) {
+    const state = {
+        processedMessages: new Set(),
+        lastCheck: Date.now(),
+        isRunning: true
+    };
+
+    const checkEmails = async () => {
+        if (!state.isRunning) return;
+        try {
+            const updatedInbox = await mailInstance.getInbox();
+            if (updatedInbox.data?.inbox?.length > 0) {
+                const sortedMessages = [...updatedInbox.data.inbox].sort((a, b) => new Date(b.date) - new Date(a.date));
+                for (const message of sortedMessages) {
+                    if (!state.processedMessages.has(message.id)) {
+                        const messageDetail = await mailInstance.getMessage(message.id);
+                        const cleanContent = messageDetail.data?.html ? messageDetail.data.html.replace(/<[^>]*>?/gm, '').trim() : 'No text content';
+                        const messageInfo = `*📩 Pesan Baru!*\n` +
+                                           `👤 *Penerima:* @${sender.split('@')[0]}\n` +
+                                           `📧 *Dari:* ${message.from || 'Anomali'}\n` +
+                                           `📩 *Ke Email:* ${emailId}\n\n` +
+                                           `📜 *Subjek:* ${message.subject || 'Tanpa Subjek'}\n` +
+                                           `—————————————————\n` +
+                                           `💬 *Isi:*\n${cleanContent}`;
+                        await naze.sendMessage(chatId, {
+                            text: messageInfo,
+                            contextInfo: {
+                                mentionedJid: [sender],
+                                externalAdReply: {
+                                    title: '📩 Pesan Baru',
+                                    body: 'Cek Kotak Masukmu!',
+                                    thumbnailUrl: 'https://i.supa.codes/Ch7yYQ',
+                                    mediaType: 1,
+                                    previewType: 1,
+                                    renderLargerThumbnail: false
+                                }
+                            }
+                        }, { quoted: originalMessage });
+                        state.processedMessages.add(message.id);
+                    }
+                }
+            }
+        } catch (err) {
+            console.error(`Error memantau email (${emailId}): ${err.message}`);
+        }
+    };
+
+    const interval = setInterval(checkEmails, 10000);
+    activeMonitoringIntervals[`${userId}_${emailId}`] = interval;
+    setTimeout(() => {
+        state.isRunning = false;
+        clearInterval(interval);
+        delete activeMonitoringIntervals[`${userId}_${emailId}`];
+    }, 10 * 60 * 1000);
+}
+
+module.exports = {
+    name: 'tempmail',
+    alias: ['getmail'],
+    run: async ({ naze, m }) => {
+        try {
+            
+
+            const chatId = m.chat;
+            const userId = m.sender;
+            if (!tempmailData[userId]) tempmailData[userId] = [];
+
+            const activeEmails = tempmailData[userId].filter(mail => new Date(mail.expiresAt) > new Date());
+            if (activeEmails.length > 0) {
+                const emailList = activeEmails.map((mail, index) => {
+                    const remainingTime = getRemainingTime(mail.expiresAt);
+                    return `📧 *Email ${index + 1}:* ${mail.email}\n(Aktif: ${remainingTime})\n`;
+                }).join('\n');
+                const message = `*📬 Daftar Email Aktif!*\n` +
+                               `👤 *User:* @${userId.split('@')[0]}\n` +
+                               `—————————————————\n` +
+                               `${emailList}\n` +
+                               `—————————————————\n` +
+                               `💡 Aku akan buatkan email baru untukmu!`;
+                await naze.sendMessage(chatId, {
+                    text: message,
+                    contextInfo: {
+                        mentionedJid: [userId],
+                        externalAdReply: {
+                            title: '📬 TempMail Aktif',
+                            body: 'Daftar Emailmu!',
+                            thumbnailUrl: 'https://i.supa.codes/7jvYJg',
+                            mediaType: 1,
+                            previewType: 1,
+                            renderLargerThumbnail: false
+                        }
+                    }
+                }, { quoted: m });
+            }
+
+            const { email, sessionId, expiresAt } = await createTempMail();
+            tempmailData[userId].push({ email, sessionId, expiresAt, chatId, originalMessage: m });
+            saveTempMail(tempmailData);
+
+            const expiresAtDate = new Date(expiresAt);
+            const timeUntilExpiry = expiresAtDate - new Date();
+            if (timeUntilExpiry > 0) {
+                activeTempMailTimers[`${userId}_${email}`] = setTimeout(async () => {
+                    if (tempmailData[userId]) {
+                        tempmailData[userId] = tempmailData[userId].filter(mail => mail.email !== email);
+                        if (tempmailData[userId].length === 0) delete tempmailData[userId];
+                        saveTempMail(tempmailData);
+                        const message = `*⏳ TempMail Kadaluarsa!*\n` +
+                                       `👤 *User:* @${userId.split('@')[0]}\n` +
+                                       `📧 *Alamat:* ${email}\n` +
+                                       `—————————————————\n` +
+                                       `💡 Waktunya habis! Buat email baru dengan ${m.prefix}${m.command}.`;
+                        await naze.sendMessage(chatId, {
+                            text: message,
+                            contextInfo: {
+                                mentionedJid: [userId],
+                                externalAdReply: {
+                                    title: '⏳ TempMail Kadaluarsa',
+                                    body: 'Buat Email Baru Sekarang!',
+                                    thumbnailUrl: 'https://i.supa.codes/JxATUS',
+                                    mediaType: 1,
+                                    previewType: 1,
+                                    renderLargerThumbnail: false
+                                }
+                            }
+                        }, { quoted: m });
+                        delete activeTempMailTimers[`${userId}_${email}`];
+                    }
+                }, timeUntilExpiry);
+            }
+
+            monitorEmails(naze, chatId, sessionId, userId, m, email, userId);
+            const remainingTime = getRemainingTime(expiresAt);
+            const message = `*📧 TempMail Berhasil Dibuat!*\n` +
+                           `👤 *User:* @${userId.split('@')[0]}\n` +
+                           `📬 *Alamat:* ${email}\n` +
+                           `⏳ *Aktif:* ${remainingTime}\n` +
+                           `—————————————————\n` +
+                           `💡 Tunggu pesan masuk, aku akan beri tahu!`;
+            
+            await naze.sendMessage(chatId, {
+                text: message,
+                contextInfo: {
+                    mentionedJid: [userId],
+                    externalAdReply: {
+                        title: '📧 TempMail Dibuat',
+                        body: 'Kotak Masuk Sementara Aktif!',
+                        thumbnailUrl: 'https://i.supa.codes/PBm9RI',
+                        mediaType: 1,
+                        previewType: 1,
+                        renderLargerThumbnail: false
+                    }
+                }
+            }, { quoted: m });
+        } catch (err) {
+            console.error(`Gagal membuat tempmail: ${err.message}`);
+            
+            await global.handleError(naze, m, err, { sendRawError: true, useGemini: true });
+        }
+    }
+};
